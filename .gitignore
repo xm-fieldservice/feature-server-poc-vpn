@@ -1,0 +1,50 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+venv/
+.env/
+.env.*/
+.venv/
+env/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 测试 & 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+
+# 笔记本 & 临时
+.ipynb_checkpoints/
+*.log
+*.tmp
+
+# 大文件 & 运行时二进制（避免再触发 100MB 限制）
+bin/
+*.exe
+*.dll
+*.pdb
+*.iso
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# 操作系统垃圾文件
+.DS_Store
+Thumbs.db
