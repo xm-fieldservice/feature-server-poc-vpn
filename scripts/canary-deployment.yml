@@ -1,0 +1,570 @@
+---
+# 混合算力平台 - 灰度发布与回滚流程
+# 基于蓝绿部署和流量切分的渐进式发布策略
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: canary-deployment-config
+  namespace: hybrid-compute
+data:
+  # 灰度发布配置
+  canary.strategy: "blue-green"
+  canary.step.interval: "5m"
+  canary.step.weight.increment: "10"
+  canary.max.traffic.percentage: "100"
+  canary.auto.promote.enabled: "false"
+  canary.rollback.on.failure: "true"
+  
+  # 健康检查配置
+  health.check.interval: "30s"
+  health.check.timeout: "10s"
+  health.check.retries: "3"
+  health.check.success.threshold: "2"
+  health.check.failure.threshold: "3"
+  
+  # 指标阈值配置
+  metrics.error.rate.threshold: "0.05"
+  metrics.latency.p95.threshold: "300s"
+  metrics.cpu.usage.threshold: "80"
+  metrics.memory.usage.threshold: "85"
+  metrics.gpu.usage.threshold: "90"
+
+---
+# 服务网格流量切分配置
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: hybrid-compute-canary-vs
+  namespace: hybrid-compute
+spec:
+  hosts:
+  - "*.hybrid-compute.local"
+  - hybrid-compute-api
+  http:
+  - name: "canary-routing"
+    match:
+    - headers:
+        x-canary-version:
+          exact: "v2"
+    route:
+    - destination:
+        host: hybrid-compute-api
+        subset: v2
+      weight: 100
+    - destination:
+        host: hybrid-compute-api
+        subset: v1
+      weight: 0
+  - name: "gradual-traffic-shift"
+    route:
+    - destination:
+        host: hybrid-compute-api
+        subset: v1
+      weight: 90
+    - destination:
+        host: hybrid-compute-api
+        subset: v2
+      weight: 10
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: hybrid-compute-canary-dr
+  namespace: hybrid-compute
+spec:
+  host: hybrid-compute-api
+  subsets:
+  - name: v1
+    labels:
+      version: v1.0.0
+  - name: v2
+    labels:
+      version: v2.0.0-canary
+
+---
+# 蓝绿部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hybrid-compute-api-blue
+  namespace: hybrid-compute
+  labels:
+    app: hybrid-compute-api
+    version: v1.0.0
+    deployment: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hybrid-compute-api
+      version: v1.0.0
+  template:
+    metadata:
+      labels:
+        app: hybrid-compute-api
+        version: v1.0.0
+        deployment: blue
+    spec:
+      containers:
+      - name: api-gateway
+        image: hybrid-compute/api-gateway:v1.0.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DEPLOYMENT_COLOR
+          value: "blue"
+        - name: SERVER_PORT
+          value: "8080"
+        - name: JOB_SCHEDULER_URL
+          value: "http://job-scheduler:2480"
+        - name: AUTH_ENABLED
+          value: "true"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: jwt-secret
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hybrid-compute-api-green
+  namespace: hybrid-compute
+  labels:
+    app: hybrid-compute-api
+    version: v2.0.0-canary
+    deployment: green
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hybrid-compute-api
+      version: v2.0.0-canary
+  template:
+    metadata:
+      labels:
+        app: hybrid-compute-api
+        version: v2.0.0-canary
+        deployment: green
+    spec:
+      containers:
+      - name: api-gateway
+        image: hybrid-compute/api-gateway:v2.0.0-canary
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DEPLOYMENT_COLOR
+          value: "green"
+        - name: SERVER_PORT
+          value: "8080"
+        - name: JOB_SCHEDULER_URL
+          value: "http://job-scheduler:2480"
+        - name: AUTH_ENABLED
+          value: "true"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: jwt-secret
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# 服务配置 - 指向当前活跃部署
+apiVersion: v1
+kind: Service
+metadata:
+  name: hybrid-compute-api
+  namespace: hybrid-compute
+  labels:
+    app: hybrid-compute-api
+spec:
+  selector:
+    app: hybrid-compute-api
+    deployment: blue  # 初始指向蓝环境
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# 金丝雀分析配置
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: hybrid-compute-api
+  namespace: hybrid-compute
+spec:
+  # 目标部署引用
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hybrid-compute-api-blue
+  # 服务配置
+  service:
+    port: 8080
+    targetPort: 8080
+    # 流量策略
+    trafficPolicy:
+      tls:
+        mode: DISABLE
+    # 请求头匹配
+    match:
+    - headers:
+        x-canary:
+          exact: "true"
+    # 重试策略
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+      retryOn: "gateway-error,connect-failure,refused-stream"
+  # 分析配置
+  analysis:
+    # 分析间隔
+    interval: 1m
+    # 阈值
+    threshold: 5
+    # 最大失败次数
+    maxWeight: 50
+    stepWeight: 10
+    # 指标
+    metrics:
+    - name: request-success-rate
+      threshold: 99
+      interval: 1m
+    - name: request-duration
+      threshold: 500
+      interval: 30s
+    - name: "custom-error-rate"
+      threshold: 5
+      query: |
+        100 - (
+          sum(
+            rate(
+              http_requests_total{
+                namespace="hybrid-compute",
+                service="hybrid-compute-api",
+                status!~"5.."
+              }[1m]
+            )
+          )
+          /
+          sum(
+            rate(
+              http_requests_total{
+                namespace="hybrid-compute",
+                service="hybrid-compute-api"
+              }[1m]
+            )
+          )
+          * 100
+        )
+    # Webhook 检查
+    webhooks:
+      - name: "load-test"
+        type: pre-rollout
+        url: http://flagger-loadtester.hybrid-compute/
+        timeout: 5m
+        metadata:
+          cmd: "hey -z 1m -q 10 -c 2 http://hybrid-compute-api.hybrid-compute:8080/health"
+      - name: "acceptance-test"
+        type: rollout
+        url: http://flagger-loadtester.hybrid-compute/
+        timeout: 2m
+        metadata:
+          type: "bash"
+          cmd: "curl -s http://hybrid-compute-api.hybrid-compute:8080/health | grep '\"status\":\"healthy\"'"
+
+---
+# 自动回滚配置
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: auto-rollback-check
+  namespace: hybrid-compute
+spec:
+  schedule: "*/5 * * * *"  # 每5分钟执行一次
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: rollback-checker
+            image: hybrid-compute/rollback-checker:v1.0.0
+            env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:9090"
+            - name: ERROR_RATE_THRESHOLD
+              value: "0.05"
+            - name: LATENCY_THRESHOLD
+              value: "300"
+            - name: NAMESPACE
+              value: "hybrid-compute"
+            - name: DEPLOYMENT_NAME
+              value: "hybrid-compute-api"
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              # 检查错误率
+              ERROR_RATE=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+                --data-urlencode 'query=sum(rate(http_requests_total{namespace="'"$NAMESPACE"'",status=~"5.."}[5m])) / sum(rate(http_requests_total{namespace="'"$NAMESPACE"'"} [5m]))' | \
+                jq -r '.data.result[0].value[1] // "0"')
+              
+              # 检查P95延迟
+              LATENCY=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+                --data-urlencode 'query=histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{namespace="'"$NAMESPACE"'"} [5m])) by (le))' | \
+                jq -r '.data.result[0].value[1] // "0"')
+              
+              echo "当前错误率: $ERROR_RATE, 阈值: $ERROR_RATE_THRESHOLD"
+              echo "当前P95延迟: $LATENCY, 阈值: $LATENCY_THRESHOLD"
+              
+              # 如果超过阈值，触发回滚
+              if (( $(echo "$ERROR_RATE > $ERROR_RATE_THRESHOLD" | bc -l) )) || (( $(echo "$LATENCY > $LATENCY_THRESHOLD" | bc -l) )); then
+                echo "指标超过阈值，触发自动回滚"
+                kubectl rollout undo deployment/$DEPLOYMENT_NAME -n $NAMESPACE
+                # 发送告警
+                curl -X POST -H 'Content-type: application/json' \
+                  --data '{"text":"自动回滚已触发: 错误率 $ERROR_RATE, 延迟 $LATENCY"}' \
+                  $SLACK_WEBHOOK_URL
+              else
+                echo "指标正常，无需回滚"
+              fi
+          restartPolicy: OnFailure
+
+---
+# 流量切换脚本
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-switch-scripts
+  namespace: hybrid-compute
+data:
+  switch-to-green.sh: |
+    #!/bin/bash
+    echo "切换到绿环境 (v2.0.0-canary)"
+    
+    # 更新服务选择器
+    kubectl patch service hybrid-compute-api -n hybrid-compute \
+      -p '{"spec":{"selector":{"deployment":"green"}}}'
+    
+    # 等待服务稳定
+    echo "等待服务稳定..."
+    sleep 30
+    
+    # 验证切换
+    RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://hybrid-compute-api.hybrid-compute:8080/health)
+    if [ "$RESPONSE" -eq 200 ]; then
+      echo "✅ 成功切换到绿环境"
+    else
+      echo "❌ 切换到绿环境失败"
+      exit 1
+    fi
+
+  switch-to-blue.sh: |
+    #!/bin/bash
+    echo "切换回蓝环境 (v1.0.0)"
+    
+    # 更新服务选择器
+    kubectl patch service hybrid-compute-api -n hybrid-compute \
+      -p '{"spec":{"selector":{"deployment":"blue"}}}'
+    
+    # 等待服务稳定
+    echo "等待服务稳定..."
+    sleep 30
+    
+    # 验证切换
+    RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://hybrid-compute-api.hybrid-compute:8080/health)
+    if [ "$RESPONSE" -eq 200 ]; then
+      echo "✅ 成功切换回蓝环境"
+    else
+      echo "❌ 切换回蓝环境失败"
+      exit 1
+    fi
+
+  gradual-traffic-shift.sh: |
+    #!/bin/bash
+    # 渐进式流量切换
+    STEPS=("10" "25" "50" "75" "100")
+    
+    for weight in "${STEPS[@]}"; do
+      echo "将 $weight% 流量切换到新版本..."
+      
+      # 更新VirtualService权重
+      kubectl patch virtualservice hybrid-compute-canary-vs -n hybrid-compute \
+        --type='json' -p='[
+          {"op": "replace", "path": "/spec/http/1/route/0/weight", "value": '"$((100 - weight))"'},
+          {"op": "replace", "path": "/spec/http/1/route/1/weight", "value": '"$weight"'}
+        ]'
+      
+      echo "等待 $CANARY_STEP_INTERVAL 分钟进行下一阶段..."
+      sleep ${CANARY_STEP_INTERVAL:-300}
+      
+      # 检查健康状态
+      if ! check_health; then
+        echo "❌ 健康检查失败，回滚流量"
+        kubectl patch virtualservice hybrid-compute-canary-vs -n hybrid-compute \
+          --type='json' -p='[
+            {"op": "replace", "path": "/spec/http/1/route/0/weight", "value": 100},
+            {"op": "replace", "path": "/spec/http/1/route/1/weight", "value": 0}
+          ]'
+        exit 1
+      fi
+    done
+    
+    echo "✅ 渐进式流量切换完成"
+
+  check_health: |
+    #!/bin/bash
+    function check_health() {
+      local retries=3
+      local timeout=10
+      
+      for i in $(seq 1 $retries); do
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "x-canary-version: v2" \
+          http://hybrid-compute-api.hybrid-compute:8080/health)
+        
+        if [ "$RESPONSE" -eq 200 ]; then
+          return 0
+        fi
+        
+        sleep $timeout
+      done
+      
+      return 1
+    }
+
+---
+# 回滚策略配置
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hybrid-compute-api-pdb
+  namespace: hybrid-compute
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: hybrid-compute-api
+
+---
+# 部署策略
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hybrid-compute-api-rollback-strategy
+  namespace: hybrid-compute
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  revisionHistoryLimit: 10  # 保留10个历史版本用于回滚
+
+---
+# 监控告警规则 - 回滚触发条件
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hybrid-compute-rollback-alerts
+  namespace: hybrid-compute
+spec:
+  groups:
+  - name: deployment.metrics
+    rules:
+    - alert: HighErrorRate
+      expr: |
+        sum(rate(http_requests_total{namespace="hybrid-compute",status=~"5.."}[5m])) 
+        / sum(rate(http_requests_total{namespace="hybrid-compute"}[5m])) > 0.05
+      for: 2m
+      labels:
+        severity: critical
+        component: api-gateway
+      annotations:
+        summary: "高错误率检测到，可能触发自动回滚"
+        description: "错误率超过5%，当前值为 {{ $value }}"
+        
+    - alert: HighLatency
+      expr: |
+        histogram_quantile(0.95, 
+          sum(rate(http_request_duration_seconds_bucket{namespace="hybrid-compute"}[5m])) by (le)
+        ) > 300
+      for: 3m
+      labels:
+        severity: warning
+        component: api-gateway
+      annotations:
+        summary: "高延迟检测到"
+        description: "P95延迟超过300秒，当前值为 {{ $value }}"
+        
+    - alert: ServiceUnavailable
+      expr: |
+        up{job=~"hybrid-compute-api.*"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        component: api-gateway
+      annotations:
+        summary: "服务不可用"
+        description: "服务实例 {{ $labels.instance }} 不可用"
+
+---
+# 手动回滚命令文档
+# 回滚到上一个版本:
+# kubectl rollout undo deployment/hybrid-compute-api -n hybrid-compute
+#
+# 回滚到特定版本:
+# kubectl rollout undo deployment/hybrid-compute-api -n hybrid-compute --to-revision=3
+#
+# 查看部署历史:
+# kubectl rollout history deployment/hybrid-compute-api -n hybrid-compute
+#
+# 查看特定版本详情:
+# kubectl rollout history deployment/hybrid-compute-api -n hybrid-compute --revision=3

@@ -1,0 +1,283 @@
+# 混合算力平台 - 本地开发环境 Docker Compose 配置
+# 用于本地开发和测试环境
+
+version: '3.8'
+
+services:
+  # NATS 消息队列
+  nats:
+    image: nats:2.9
+    container_name: hybrid-compute-nats
+    ports:
+      - "4222:4222"  # 客户端端口
+      - "8222:8222"  # 监控端口
+    command: [
+      "--jetstream",
+      "--store_dir", "/data/jetstream",
+      "--max_memory", "1G",
+      "--max_file", "10G"
+    ]
+    volumes:
+      - nats_data:/data/jetstream
+    environment:
+      - NATS_SERVER_NAME=hybrid-compute-nats
+    healthcheck:
+      test: ["CMD", "nats", "pub", "--server", "nats:4222", "health", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # MinIO 对象存储
+  minio:
+    image: minio/minio:RELEASE.2023-10-25T06-33-25Z
+    container_name: hybrid-compute-minio
+    ports:
+      - "9000:9000"  # API端口
+      - "9001:9001"  # 控制台端口
+    command: server --console-address ":9001" /data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DEFAULT_BUCKETS=hybrid-compute,backups,logs
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # Redis 缓存和状态存储
+  redis:
+    image: redis:7-alpine
+    container_name: hybrid-compute-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass redispass
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # Prometheus 监控
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hybrid-compute-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - prometheus_data:/prometheus
+      - ./configs/templates/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # Grafana 仪表板
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hybrid-compute-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/templates/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./configs/templates/grafana-datasources:/etc/grafana/provisioning/datasources
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # Loki 日志聚合
+  loki:
+    image: grafana/loki:latest
+    container_name: hybrid-compute-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+    networks:
+      - hybrid-compute-network
+
+  # Promtail 日志收集
+  promtail:
+    image: grafana/promtail:latest
+    container_name: hybrid-compute-promtail
+    volumes:
+      - /var/log:/var/log:ro
+      - ./configs/templates/promtail-config.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - hybrid-compute-network
+
+  # 示例 MCP Server - LLM 推理服务
+  mcp-llm-inference:
+    build:
+      context: ./src/local/mcp-servers/llm-inference
+      dockerfile: Dockerfile
+    container_name: hybrid-compute-mcp-llm
+    ports:
+      - "2470:2470"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=2470
+      - MCP_SERVER_NAME=mcp-llm-inference
+      - NATS_URL=nats://nats:4222
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=hybrid-compute
+      - LOGGING_LEVEL=INFO
+      - METRICS_ENABLED=true
+      - METRICS_PORT=9091
+    volumes:
+      - ./src/local/mcp-servers/llm-inference:/app
+    depends_on:
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2470/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # 示例 MCP Server - 图像生成服务
+  mcp-image-generation:
+    build:
+      context: ./src/local/mcp-servers/image-generation
+      dockerfile: Dockerfile
+    container_name: hybrid-compute-mcp-image
+    ports:
+      - "2471:2471"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=2471
+      - MCP_SERVER_NAME=mcp-image-generation
+      - NATS_URL=nats://nats:4222
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=hybrid-compute
+      - LOGGING_LEVEL=INFO
+      - METRICS_ENABLED=true
+      - METRICS_PORT=9092
+    volumes:
+      - ./src/local/mcp-servers/image-generation:/app
+    depends_on:
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2471/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+  # 任务调度器
+  scheduler:
+    build:
+      context: ./src/cloud/control-plane
+      dockerfile: Dockerfile
+    container_name: hybrid-compute-scheduler
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=redispass
+      - LOGGING_LEVEL=INFO
+    volumes:
+      - ./src/cloud/control-plane:/app
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hybrid-compute-network
+
+  # API 网关
+  api-gateway:
+    build:
+      context: ./src/cloud/control-plane
+      dockerfile: Dockerfile.api-gateway
+    container_name: hybrid-compute-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=redispass
+      - LOGGING_LEVEL=INFO
+    volumes:
+      - ./src/cloud/control-plane:/app
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hybrid-compute-network
+
+volumes:
+  nats_data:
+    driver: local
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
+
+networks:
+  hybrid-compute-network:
+    driver: bridge
+    name: hybrid-compute-network
+
+# 环境变量配置说明
+# 复制 .env.template 为 .env.local 并修改相应配置
+# 启动命令: docker-compose -f docker-compose.local.yml up -d
+# 停止命令: docker-compose -f docker-compose.local.yml down

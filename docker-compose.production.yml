@@ -1,0 +1,333 @@
+version: '3.8'
+
+services:
+  # VPN 网络层
+  headscale:
+    image: headscale/headscale:0.22.3
+    container_name: headscale
+    restart: unless-stopped
+    volumes:
+      - ./data/headscale:/var/lib/headscale
+      - ./configs/templates/headscale-config.yaml:/etc/headscale/config.yaml
+    ports:
+      - "8080:8080"  # 管理界面
+      - "3478:3478/udp"  # STUN
+    networks:
+      - hybrid-compute-net
+    command: ["headscale", "serve"]
+
+  # 消息队列层
+  nats:
+    image: nats:2.9-alpine
+    container_name: nats
+    restart: unless-stopped
+    ports:
+      - "4222:4222"  # 客户端连接
+      - "8222:8222"  # 监控界面
+    volumes:
+      - ./configs/templates/nats-config.template.yaml:/etc/nats/nats.conf
+      - ./data/nats:/data/nats
+    command: ["-c", "/etc/nats/nats.conf"]
+    networks:
+      - hybrid-compute-net
+
+  # 对象存储层
+  minio:
+    image: minio/minio:RELEASE.2023-10-25T06-33-25Z
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"  # API端口
+      - "9001:9001"  # 控制台端口
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme123}
+      MINIO_DOMAIN: minio.hybrid-compute.local
+    volumes:
+      - ./data/minio:/data
+      - ./configs/templates/minio-config.template.yaml:/etc/config/config.yaml
+    command: ["server", "/data", "--console-address", ":9001", "--config-dir", "/etc/config"]
+    networks:
+      - hybrid-compute-net
+
+  # 缓存层
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-redis123}"]
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - hybrid-compute-net
+
+  # 监控层 - Prometheus
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/templates/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - hybrid-compute-net
+
+  # 监控层 - Grafana
+  grafana:
+    image: grafana/grafana:10.0.3
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-grafana123}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - ./configs/templates/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./configs/templates/grafana-dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml
+      - ./data/grafana:/var/lib/grafana
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - prometheus
+
+  # 日志层 - Loki
+  loki:
+    image: grafana/loki:2.8.4
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./configs/templates/loki-config.yaml:/etc/loki/local-config.yaml
+      - ./data/loki:/loki
+    networks:
+      - hybrid-compute-net
+
+  # 日志收集器 - Promtail
+  promtail:
+    image: grafana/promtail:2.8.4
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - ./configs/templates/promtail-config.yaml:/etc/promtail/config.yaml
+      - /var/log:/var/log:ro
+      - ./data/logs:/data/logs
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - loki
+
+  # MCP 服务 - LLM推理
+  mcp-llm-inference:
+    build:
+      context: ./services/mcp-llm-inference
+      dockerfile: Dockerfile
+    container_name: mcp-llm-inference
+    restart: unless-stopped
+    ports:
+      - "2470:2470"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "2470"
+      MCP_SERVER_NAME: "mcp-llm-inference"
+      NATS_URL: "nats://nats:4222"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-admin}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-changeme123}"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-redis123}"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./data/models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - nats
+      - minio
+      - redis
+
+  # MCP 服务 - 图像生成
+  mcp-image-generation:
+    build:
+      context: ./services/mcp-image-generation
+      dockerfile: Dockerfile
+    container_name: mcp-image-generation
+    restart: unless-stopped
+    ports:
+      - "2471:2471"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "2471"
+      MCP_SERVER_NAME: "mcp-image-generation"
+      NATS_URL: "nats://nats:4222"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-admin}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-changeme123}"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-redis123}"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./data/models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - nats
+      - minio
+      - redis
+
+  # MCP 服务 - 数据处理
+  mcp-data-processing:
+    build:
+      context: ./services/mcp-data-processing
+      dockerfile: Dockerfile
+    container_name: mcp-data-processing
+    restart: unless-stopped
+    ports:
+      - "2472:2472"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "2472"
+      MCP_SERVER_NAME: "mcp-data-processing"
+      NATS_URL: "nats://nats:4222"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-admin}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-changeme123}"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-redis123}"
+      LOG_LEVEL: "INFO"
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - nats
+      - minio
+      - redis
+
+  # MCP 服务 - 深度推理
+  deepseek-reasoning:
+    build:
+      context: ./src/local
+      dockerfile: Dockerfile
+    container_name: deepseek-reasoning
+    restart: unless-stopped
+    ports:
+      - "2473:2471"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "2471"
+      MCP_SERVER_NAME: "deepseek-reasoning"
+      NATS_URL: "nats://nats:4222"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-admin}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-changeme123}"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-redis123}"
+      LOG_LEVEL: "INFO"
+      MAX_CONCURRENCY: "1"
+      METRICS_ENABLED: "true"
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - nats
+      - minio
+      - redis
+
+  # 任务调度器
+  job-scheduler:
+    build:
+      context: ./services/job-scheduler
+      dockerfile: Dockerfile
+    container_name: job-scheduler
+    restart: unless-stopped
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "2480"
+      NATS_URL: "nats://nats:4222"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-admin}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-changeme123}"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-redis123}"
+      MCP_SERVERS: "mcp-llm-inference:2470,mcp-image-generation:2471,mcp-data-processing:2472,deepseek-reasoning:2471"
+      LOG_LEVEL: "INFO"
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - nats
+      - minio
+      - redis
+      - mcp-llm-inference
+      - mcp-image-generation
+      - mcp-data-processing
+      - deepseek-reasoning
+
+  # API网关
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8080"
+      JOB_SCHEDULER_URL: "http://job-scheduler:2480"
+      AUTH_ENABLED: "true"
+      JWT_SECRET: "${JWT_SECRET:-changeme123}"
+      LOG_LEVEL: "INFO"
+    networks:
+      - hybrid-compute-net
+    depends_on:
+      - job-scheduler
+
+networks:
+  hybrid-compute-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+
+volumes:
+  headscale_data:
+    driver: local
+  nats_data:
+    driver: local
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local

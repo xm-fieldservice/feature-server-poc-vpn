@@ -1,0 +1,416 @@
+---
+# 混合算力平台 - Ansible 部署剧本
+# 基于P1阶段的模板蓝图，支持多云和本地部署
+
+- name: 部署混合算力平台基础架构
+  hosts: all
+  become: yes
+  vars:
+    # 平台配置
+    platform_namespace: "hybrid-compute"
+    platform_version: "v1.0.0"
+    
+    # 网络配置
+    vpn_cidr: "10.0.0.0/8"
+    admin_whitelist_ip: "{{ admin_ip | default('10.0.1.0/24') }}"
+    
+    # 存储配置
+    storage_class: "standard"
+    storage_size: "100Gi"
+    
+    # 服务配置
+    service_type: "ClusterIP"
+    enable_ingress: false
+    
+    # 监控配置
+    enable_monitoring: true
+    enable_logging: true
+    enable_tracing: false
+
+  tasks:
+    - name: 创建命名空间
+      kubernetes.core.k8s:
+        name: "{{ platform_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: 创建服务账户
+      kubernetes.core.k8s:
+        name: "hybrid-compute-sa"
+        namespace: "{{ platform_namespace }}"
+        api_version: v1
+        kind: ServiceAccount
+        state: present
+
+    - name: 创建角色绑定
+      kubernetes.core.k8s:
+        name: "hybrid-compute-rolebinding"
+        namespace: "{{ platform_namespace }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        state: present
+        definition:
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: edit
+          subjects:
+            - kind: ServiceAccount
+              name: hybrid-compute-sa
+              namespace: "{{ platform_namespace }}"
+
+- name: 部署网络服务
+  hosts: control_plane
+  become: yes
+  vars:
+    wireguard_port: 51820
+    wireguard_peers: "{{ vpn_peers | default([]) }}"
+    
+  tasks:
+    - name: 安装 WireGuard
+      package:
+        name: wireguard-tools
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: 配置 WireGuard 服务器
+      template:
+        src: templates/wireguard-server.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        owner: root
+        group: root
+        mode: 0600
+      notify: restart wireguard
+
+    - name: 启用 WireGuard 服务
+      systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: started
+
+    - name: 配置防火墙规则
+      ufw:
+        rule: allow
+        port: "{{ wireguard_port }}"
+        proto: udp
+      when: ansible_os_family == "Debian"
+
+  handlers:
+    - name: restart wireguard
+      systemd:
+        name: wg-quick@wg0
+        state: restarted
+
+- name: 部署消息队列 (NATS)
+  hosts: control_plane
+  become: yes
+  vars:
+    nats_version: "2.9"
+    nats_port: 4222
+    nats_cluster_port: 6222
+    nats_monitor_port: 8222
+    
+  tasks:
+    - name: 创建 NATS 配置
+      template:
+        src: templates/nats.conf.j2
+        dest: /etc/nats/nats.conf
+        owner: nats
+        group: nats
+        mode: 0644
+
+    - name: 创建 NATS 系统服务
+      template:
+        src: templates/nats.service.j2
+        dest: /etc/systemd/system/nats.service
+        owner: root
+        group: root
+        mode: 0644
+      notify: reload systemd
+
+    - name: 启动 NATS 服务
+      systemd:
+        name: nats
+        enabled: yes
+        state: started
+
+    - name: 验证 NATS 服务
+      wait_for:
+        port: "{{ nats_port }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        timeout: 30
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+- name: 部署对象存储 (MinIO)
+  hosts: data_plane
+  become: yes
+  vars:
+    minio_version: "RELEASE.2023-10-25T06-33-25Z"
+    minio_data_dir: "/data/minio"
+    minio_port: 9000
+    minio_console_port: 9001
+    
+  tasks:
+    - name: 创建数据目录
+      file:
+        path: "{{ minio_data_dir }}"
+        state: directory
+        owner: minio
+        group: minio
+        mode: 0755
+
+    - name: 下载 MinIO 二进制文件
+      get_url:
+        url: "https://dl.min.io/server/minio/release/linux-amd64/minio"
+        dest: "/usr/local/bin/minio"
+        mode: 0755
+
+    - name: 创建 MinIO 用户
+      user:
+        name: minio
+        system: yes
+        shell: /bin/false
+        home: "{{ minio_data_dir }}"
+
+    - name: 创建 MinIO 配置目录
+      file:
+        path: /etc/minio
+        state: directory
+        owner: minio
+        group: minio
+        mode: 0755
+
+    - name: 配置 MinIO 环境变量
+      template:
+        src: templates/minio-environment.j2
+        dest: /etc/minio/environment
+        owner: minio
+        group: minio
+        mode: 0600
+
+    - name: 创建 MinIO 系统服务
+      template:
+        src: templates/minio.service.j2
+        dest: /etc/systemd/system/minio.service
+        owner: root
+        group: root
+        mode: 0644
+      notify: reload systemd
+
+    - name: 启动 MinIO 服务
+      systemd:
+        name: minio
+        enabled: yes
+        state: started
+
+    - name: 初始化 MinIO 存储桶
+      shell: |
+        /usr/local/bin/mc alias set minio http://localhost:{{ minio_port }} {{ minio_root_user }} {{ minio_root_password }}
+        /usr/local/bin/mc mb minio/hybrid-compute
+        /usr/local/bin/mc anonymous set none minio/hybrid-compute
+      environment:
+        MINIO_ROOT_USER: "{{ minio_root_user }}"
+        MINIO_ROOT_PASSWORD: "{{ minio_root_password }}"
+      when: minio_root_user is defined and minio_root_password is defined
+
+- name: 部署监控栈
+  hosts: monitoring
+  become: yes
+  vars:
+    prometheus_port: 9090
+    grafana_port: 3000
+    loki_port: 3100
+    
+  tasks:
+    - name: 创建监控命名空间
+      kubernetes.core.k8s:
+        name: monitoring
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: 部署 Prometheus
+      kubernetes.core.k8s:
+        state: present
+        src: "templates/prometheus-deployment.yml"
+
+    - name: 部署 Grafana
+      kubernetes.core.k8s:
+        state: present
+        src: "templates/grafana-deployment.yml"
+
+    - name: 部署 Loki
+      kubernetes.core.k8s:
+        state: present
+        src: "templates/loki-deployment.yml"
+
+    - name: 配置监控数据源
+      template:
+        src: templates/grafana-datasources.yml.j2
+        dest: /etc/grafana/provisioning/datasources/datasources.yml
+        owner: grafana
+        group: grafana
+        mode: 0644
+      notify: restart grafana
+
+  handlers:
+    - name: restart grafana
+      systemd:
+        name: grafana-server
+        state: restarted
+
+- name: 部署 MCP 服务
+  hosts: compute_nodes
+  become: yes
+  vars:
+    mcp_services:
+      - name: mcp-llm-inference
+        port: 2470
+        gpu_enabled: true
+      - name: mcp-image-generation  
+        port: 2471
+        gpu_enabled: true
+      - name: mcp-data-processing
+        port: 2472
+        gpu_enabled: false
+        
+  tasks:
+    - name: 安装 Docker
+      include_role:
+        name: geerlingguy.docker
+
+    - name: 安装 NVIDIA Container Toolkit
+      include_tasks: tasks/install-nvidia-container-toolkit.yml
+      when: "'gpu' in group_names"
+
+    - name: 部署 MCP 服务容器
+      docker_container:
+        name: "{{ item.name }}"
+        image: "hybrid-compute/{{ item.name }}:{{ platform_version }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ item.port }}:{{ item.port }}"
+        env:
+          SERVER_HOST: "0.0.0.0"
+          SERVER_PORT: "{{ item.port }}"
+          MCP_SERVER_NAME: "{{ item.name }}"
+          NATS_URL: "nats://{{ groups.control_plane[0] }}:4222"
+          MINIO_ENDPOINT: "{{ groups.data_plane[0] }}:9000"
+        devices:
+          - "/dev/nvidia0:/dev/nvidia0"
+          - "/dev/nvidiactl:/dev/nvidiactl"
+          - "/dev/nvidia-uvm:/dev/nvidia-uvm"
+        when: item.gpu_enabled
+      loop: "{{ mcp_services }}"
+
+    - name: 配置 MCP 服务健康检查
+      systemd:
+        name: "docker-{{ item.name }}"
+        enabled: yes
+      loop: "{{ mcp_services }}"
+
+- name: 配置安全策略
+  hosts: all
+  become: yes
+  tasks:
+    - name: 配置防火墙规则
+      ufw:
+        rule: "{{ item.rule }}"
+        port: "{{ item.port }}"
+        proto: "{{ item.proto | default('tcp') }}"
+        src: "{{ item.src | default(vpn_cidr) }}"
+      loop:
+        - { rule: allow, port: 51820, proto: udp, src: "0.0.0.0/0" }
+        - { rule: allow, port: 4222, src: "{{ vpn_cidr }}" }
+        - { rule: allow, port: 9000, src: "{{ vpn_cidr }}" }
+        - { rule: allow, port: "2470-2499", src: "{{ vpn_cidr }}" }
+        - { rule: allow, port: 22, src: "{{ admin_whitelist_ip }}" }
+      when: ansible_os_family == "Debian"
+
+    - name: 配置 SSH 安全
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^{{ item.key }}"
+        line: "{{ item.key }} {{ item.value }}"
+        state: present
+      loop:
+        - { key: "PasswordAuthentication", value: "no" }
+        - { key: "PermitRootLogin", value: "no" }
+        - { key: "MaxAuthTries", value: "3" }
+      notify: restart ssh
+
+    - name: 配置 fail2ban
+      package:
+        name: fail2ban
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: 配置 fail2ban jail
+      template:
+        src: templates/fail2ban-jail.local.j2
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart fail2ban
+
+  handlers:
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+
+- name: 验证部署
+  hosts: all
+  become: yes
+  tasks:
+    - name: 验证服务状态
+      uri:
+        url: "http://localhost:{{ item.port }}/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      loop:
+        - { port: 2470, service: "mcp-llm-inference" }
+        - { port: 2471, service: "mcp-image-generation" }
+        - { port: 4222, service: "nats" }
+      when: "'compute_nodes' in group_names or 'control_plane' in group_names"
+
+    - name: 验证存储访问
+      uri:
+        url: "http://{{ groups.data_plane[0] }}:9000/minio/health/live"
+        method: GET
+        status_code: 200
+        timeout: 10
+      when: "'data_plane' in group_names"
+
+    - name: 生成部署报告
+      template:
+        src: templates/deployment-report.j2
+        dest: "/tmp/hybrid-compute-deployment-report-{{ ansible_date_time.epoch }}.md"
+        owner: root
+        group: root
+        mode: 0644
+
+- name: 清理临时文件
+  hosts: all
+  become: yes
+  tasks:
+    - name: 清理临时文件
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/ansible-tmp-*
+        - /tmp/hybrid-compute-*.yml

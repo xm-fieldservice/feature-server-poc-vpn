@@ -1,0 +1,648 @@
+name: 混合算力平台 CI 门禁
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'services/**'
+      - 'configs/**'
+      - 'scripts/**'
+      - 'docs/contracts/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'services/**'
+      - 'configs/**'
+      - 'scripts/**'
+      - 'docs/contracts/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 代码质量检查
+  code-quality:
+    name: 代码质量检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 mypy bandit pytest
+
+      - name: 代码格式化检查 (Black)
+        run: |
+          black --check --diff src/ services/
+
+      - name: 代码风格检查 (Flake8)
+        run: |
+          flake8 src/ services/ --max-line-length=88 --extend-ignore=E203,W503
+
+      - name: 类型检查 (MyPy)
+        run: |
+          mypy src/ --ignore-missing-imports
+
+      - name: 安全扫描 (Bandit)
+        run: |
+          bandit -r src/ -f json -o bandit-report.json || true
+
+      - name: 上传安全报告
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
+  # 合约一致性检查
+  contract-validation:
+    name: 合约一致性检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 验证接口合约
+        run: |
+          # 检查合约文件存在性
+          if [ ! -f "docs/contracts/interface-contract-v1.md" ]; then
+            echo "❌ 接口合约文件不存在"
+            exit 1
+          fi
+
+          # 验证JSON字段命名规范 (snake_case)
+          echo "验证JSON字段命名规范..."
+          if grep -r "isError" src/ services/ --include="*.py" --include="*.yaml" --include="*.yml"; then
+            echo "❌ 发现不符合snake_case规范的字段 (应使用is_error)"
+            exit 1
+          fi
+
+          # 验证时间戳格式
+          echo "验证时间戳格式..."
+          if grep -r "timestamp" src/ services/ --include="*.py" | grep -v "isoformat\|ISO8601"; then
+            echo "❌ 时间戳格式不符合ISO8601标准"
+            exit 1
+          fi
+
+          echo "✅ 合约一致性检查通过"
+
+      - name: 验证配置模板
+        run: |
+          # 检查必要的配置模板
+          required_templates=(
+            "configs/templates/mcp-server.template.yaml"
+            "configs/templates/nats-config.template.yaml"
+            "configs/templates/minio-config.template.yaml"
+          )
+
+          for template in "${required_templates[@]}"; do
+            if [ ! -f "$template" ]; then
+              echo "❌ 缺少必要的配置模板: $template"
+              exit 1
+            fi
+          done
+
+          echo "✅ 配置模板检查通过"
+
+  # 构建和测试
+  build-and-test:
+    name: 构建和测试
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [mcp-llm-inference, mcp-image-generation, mcp-data-processing, job-scheduler, api-gateway]
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: 构建服务镜像
+        uses: docker/build-push-action@v4
+        with:
+          context: ./services/${{ matrix.service }}
+          file: ./services/${{ matrix.service }}/Dockerfile
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: false
+
+      - name: 运行单元测试
+        run: |
+          cd services/${{ matrix.service }}
+          if [ -f "requirements-test.txt" ]; then
+            pip install -r requirements-test.txt
+          fi
+          if [ -f "test_${{ matrix.service }}.py" ]; then
+            python -m pytest test_${{ matrix.service }}.py -v
+          fi
+
+      - name: 验证健康检查端点
+        run: |
+          # 模拟健康检查
+          echo "验证 ${{ matrix.service }} 健康检查配置..."
+          if [ -f "services/${{ matrix.service }}/Dockerfile" ]; then
+            if grep -q "HEALTHCHECK" "services/${{ matrix.service }}/Dockerfile"; then
+              echo "✅ ${{ matrix.service }} 包含健康检查"
+            else
+              echo "⚠️  ${{ matrix.service }} 缺少健康检查配置"
+            fi
+          fi
+
+  # DeepSeek Reasoning 服务测试
+  deepseek-reasoning-test:
+    name: DeepSeek Reasoning 测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn prometheus_client httpx aiohttp pytest
+
+      - name: 启动 DeepSeek Reasoning 服务
+        run: |
+          export MAX_CONCURRENCY=1
+          python src/local/deepseek-reasoning-server.py &
+          echo $! > server.pid
+          sleep 5  # 等待服务启动
+
+      - name: 健康检查
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:2471/health)
+          if [ "$response" -ne 200 ]; then
+            echo "❌ 健康检查失败: HTTP $response"
+            exit 1
+          fi
+          echo "✅ 健康检查通过"
+
+      - name: 运行快速测试
+        run: |
+          timeout 30s python scripts/test-deepseek-reasoning.py --quick || exit 1
+          echo "✅ 快速测试通过"
+
+      - name: 运行综合测试
+        run: |
+          timeout 60s python scripts/test-deepseek-reasoning.py --full || exit 1
+          echo "✅ 综合测试通过"
+
+      - name: 运行 pytest DeepSeek 接口测试
+        run: |
+          pytest tests/deepseek -v
+
+      - name: 检查指标端点
+        run: |
+          response=$(curl -s http://localhost:2471/metrics)
+          if echo "$response" | grep -q "deepseek_"; then
+            echo "✅ 指标端点正常，包含 deepseek_ 指标"
+          else
+            echo "❌ 指标端点异常，未找到 deepseek_ 指标"
+            exit 1
+          fi
+
+      - name: 性能阈值检查
+        run: |
+          python - <<'PY'
+import time, httpx, sys
+start = time.time()
+try:
+    httpx.get('http://localhost:2471/health', timeout=5)
+    quick_time = time.time() - start
+except Exception:
+    quick_time = 10.0
+print(f"快速测试响应时间: {quick_time:.3f}s")
+if quick_time > 0.3:
+    print(f"❌ 快速测试响应时间超限: {quick_time:.3f}s > 0.3s")
+    sys.exit(1)
+print(f"✅ 快速测试响应时间: {quick_time:.3f}s ≤ 0.3s")
+PY
+
+      - name: 停止服务
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+
+  # DeepSeek E2E 信息性验证（不阻断）
+  deepseek-e2e-info:
+    name: DeepSeek E2E 信息性验证
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx boto3
+
+      - name: 下载并启动 MinIO (本地二进制)
+        run: |
+          set -e
+          curl -sSL -o minio https://dl.min.io/server/minio/release/linux-amd64/minio
+          chmod +x ./minio
+          mkdir -p /tmp/minio
+          export MINIO_ROOT_USER=admin
+          export MINIO_ROOT_PASSWORD=changeme123
+          ./minio server /tmp/minio --console-address ":9001" &
+          echo $! > minio.pid
+          # 等待健康
+          for i in {1..40}; do
+            if curl -sf http://localhost:9000/minio/health/ready >/dev/null; then echo "MinIO ready"; break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:9000/minio/health/ready >/dev/null
+
+      - name: 启动 DeepSeek 服务
+        run: |
+          export MAX_CONCURRENCY=1
+          python src/local/deepseek-reasoning-server.py &
+          echo $! > server.pid
+          sleep 3
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:2471/health)
+          if [ "$code" -ne 200 ]; then echo "❌ DeepSeek 健康检查失败: HTTP $code"; exit 1; fi
+
+      - name: 运行 E2E 脚本
+        run: |
+          python scripts/e2e-deepseek-job.py --prompt "CI E2E：解释量子计算的基本原理"
+
+      - name: 收尾（总是执行）
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+          if [ -f minio.pid ]; then
+            kill $(cat minio.pid) 2>/dev/null || true
+            rm minio.pid
+          fi
+
+  # DeepSeek 调度闭环 信息性验证（不阻断）
+  deepseek-scheduler-info:
+    name: DeepSeek 调度闭环 信息性验证
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx boto3
+
+      - name: 下载并启动 MinIO (本地二进制)
+        run: |
+          set -e
+          curl -sSL -o minio https://dl.min.io/server/minio/release/linux-amd64/minio
+          chmod +x ./minio
+          mkdir -p /tmp/minio
+          export MINIO_ROOT_USER=admin
+          export MINIO_ROOT_PASSWORD=changeme123
+          ./minio server /tmp/minio --console-address ":9001" &
+          echo $! > minio.pid
+          for i in {1..40}; do
+            if curl -sf http://localhost:9000/minio/health/ready >/dev/null; then echo "MinIO ready"; break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:9000/minio/health/ready >/dev/null
+
+      - name: 启动 DeepSeek 服务
+        run: |
+          export MAX_CONCURRENCY=1
+          python src/local/deepseek-reasoning-server.py &
+          echo $! > server.pid
+          sleep 3
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:2471/health)
+          if [ "$code" -ne 200 ]; then echo "❌ DeepSeek 健康检查失败: HTTP $code"; exit 1; fi
+
+      - name: 准备输入对象
+        run: |
+          python - <<'PY'
+import json,boto3,uuid
+from botocore.exceptions import ClientError
+
+BUCKET='hybrid-compute'
+s3=boto3.client('s3',endpoint_url='http://localhost:9000',aws_access_key_id='admin',aws_secret_access_key='changeme123',verify=False)
+
+# ensure bucket exists
+try:
+    s3.head_bucket(Bucket=BUCKET)
+except ClientError as e:
+    code = int(e.response.get('ResponseMetadata',{}).get('HTTPStatusCode',0))
+    if code == 404:
+        s3.create_bucket(Bucket=BUCKET)
+    else:
+        raise
+
+job='ci'+uuid.uuid4().hex[:8]
+key=f'inputs/{job}/input.json'
+payload={'prompt':'CI 调度闭环：解释人工智能基本概念','context':None,'max_tokens':400,'temperature':0.7}
+s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(payload, ensure_ascii=False).encode('utf-8'), ContentType='application/json; charset=utf-8')
+print(job)
+PY
+
+      - name: 运行调度器（一次扫描）
+        run: |
+          python scripts/scheduler-poller.py --once --endpoint http://localhost:9000 --access-key admin --secret-key changeme123 --bucket hybrid-compute
+
+      - name: 验证输出对象
+        run: |
+          python - <<'PY'
+import boto3,sys,json
+s3=boto3.client('s3',endpoint_url='http://localhost:9000',aws_access_key_id='admin',aws_secret_access_key='changeme123',verify=False)
+resp=s3.list_objects_v2(Bucket='hybrid-compute', Prefix='outputs/')
+keys=[c['Key'] for c in resp.get('Contents', [])] if resp.get('Contents') else []
+print(json.dumps(keys,ensure_ascii=False))
+if not keys:
+    print('❌ 未发现输出对象')
+    sys.exit(1)
+print('✅ 输出对象数量:', len(keys))
+PY
+
+      - name: 收尾（总是执行）
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+          if [ -f minio.pid ]; then
+            kill $(cat minio.pid) 2>/dev/null || true
+            rm minio.pid
+          fi
+
+  # DeepSeek SLO 信息性探针（429 比例 & P95 时延）
+  deepseek-slo-probe-info:
+    name: DeepSeek SLO 信息性探针
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "src/local/requirements.txt" ]; then
+            pip install -r src/local/requirements.txt
+          else
+            pip install fastapi uvicorn prometheus_client httpx aiohttp
+          fi
+
+      - name: 运行 SLO 探针（信息性）
+        run: |
+          python scripts/canary-dryrun.py \
+            --candidate-port 2473 \
+            --max-concurrency 1 \
+            --concurrency 2 \
+            --requests 40 \
+            --timeout 5.0 \
+            --threshold-429 0.05 \
+            --threshold-p95 0.45 || true
+
+  # 集成测试
+  integration-test:
+    name: 集成测试
+    runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:2.9-alpine
+        ports:
+          - 4222:4222
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装测试依赖
+        run: |
+          pip install pytest asyncio-nats-client redis minio
+
+      - name: 运行集成测试
+        run: |
+          python -m pytest tests/integration/ -v
+
+      - name: 验证服务发现
+        run: |
+          python -c "
+          import asyncio
+          import asyncio_nats
+          async def test_nats():
+              try:
+                  nc = await asyncio_nats.connect('nats://localhost:4222')
+                  print('✅ NATS 连接成功')
+                  await nc.close()
+              except Exception as e:
+                  print(f'❌ NATS 连接失败: {e}')
+                  exit(1)
+          asyncio.run(test_nats())
+          "
+
+      - name: 验证 Redis 连接
+        run: |
+          python -c "
+          import redis
+          try:
+              r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+              r.ping()
+              print('✅ Redis 连接成功')
+          except Exception as e:
+              print(f'❌ Redis 连接失败: {e}')
+              exit(1)
+          "
+
+  # 安全扫描
+  security-scan:
+    name: 安全扫描
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行 Trivy 漏洞扫描
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: 上传 Trivy 扫描结果
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: 检查依赖漏洞
+        run: |
+          if [ -f "requirements.txt" ]; then
+            pip install safety
+            safety check --json > safety-report.json
+          fi
+
+      - name: 上传安全报告
+        uses: actions/upload-artifact@v3
+        with:
+          name: safety-security-report
+          path: safety-report.json
+
+  # 配置验证
+  config-validation:
+    name: 配置验证
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 验证 Docker Compose 配置
+        run: |
+          docker-compose -f docker-compose.production.yml config
+
+      - name: 验证 Ansible 语法
+        run: |
+          ansible-lint scripts/deploy-ansible-playbook.yml
+
+      - name: 验证 YAML 语法
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: 安装 YAML 验证工具
+        run: pip install yamllint
+
+      - name: 运行 YAML 语法检查
+        run: |
+          yamllint -d relaxed configs/ scripts/ .github/
+
+      - name: 验证端口配置
+        run: |
+          # 检查端口冲突
+          echo "验证服务端口配置..."
+          ports=$(grep -r "ports:" docker-compose.*.yml configs/templates/ | grep -oE '[0-9]+:[0-9]+' | cut -d: -f1 | sort | uniq -d)
+          if [ -n "$ports" ]; then
+            echo "❌ 发现端口冲突: $ports"
+            exit 1
+          fi
+          echo "✅ 端口配置检查通过"
+
+  # 文档检查
+  docs-check:
+    name: 文档检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 验证文档完整性
+        run: |
+          required_docs=(
+            "docs/contracts/interface-contract-v1.md"
+            "docs/security/port-acl-table-v1.md"
+            "docs/monitoring/alert-thresholds-v1.md"
+            "docs/performance/cost-slo-metrics-v1.md"
+            "README.md"
+          )
+
+          for doc in "${required_docs[@]}"; do
+            if [ ! -f "$doc" ]; then
+              echo "❌ 缺少必要的文档: $doc"
+              exit 1
+            fi
+          done
+
+          echo "✅ 文档完整性检查通过"
+
+      - name: 验证 ADR 模板
+        run: |
+          if [ ! -f "docs/governance/adr-template.md" ]; then
+            echo "❌ 缺少 ADR 模板"
+            exit 1
+          fi
+
+          # 检查新功能是否有对应的 ADR
+          new_features=$(git diff --name-only HEAD~1 HEAD | grep -E "src/|services/" | head -5)
+          if [ -n "$new_features" ]; then
+            echo "新功能文件: $new_features"
+            echo "请确保为重大架构变更创建 ADR"
+          fi
+
+  # 门禁汇总
+  quality-gate:
+    name: 质量门禁汇总
+    runs-on: ubuntu-latest
+    needs: [code-quality, contract-validation, build-and-test, integration-test, security-scan, config-validation, docs-check, deepseek-reasoning-test]
+    steps:
+      - name: 汇总检查结果
+        run: |
+          echo "🎉 所有质量门禁检查通过!"
+          echo ""
+          echo "📊 检查汇总:"
+          echo "  ✅ 代码质量检查"
+          echo "  ✅ 合约一致性检查"
+          echo "  ✅ 构建和测试"
+          echo "  ✅ 集成测试"
+          echo "  ✅ 安全扫描"
+          echo "  ✅ 配置验证"
+          echo "  ✅ 文档检查"
+          echo "  ✅ DeepSeek Reasoning 测试"
+          echo ""
+          echo "🚀 代码质量符合部署标准"
+
+      - name: 创建质量报告
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-gate-report
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 30
